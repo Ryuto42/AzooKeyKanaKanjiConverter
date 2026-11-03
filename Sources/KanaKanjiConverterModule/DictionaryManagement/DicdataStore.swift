@@ -421,8 +421,9 @@ public final class DicdataStore {
             targetLOUDS.map {
                 ($0.key, $0.value.indicesInDepth(depth: minCount - 1 ..< .max))
             },
+            // LOUDSの探索（`minCount - 1`以降の深さ）と揃え、ちょうど`minCount`文字の語も含める
             dynamicDicdata.flatMap {
-                minCount < $0.key + 1 ? $0.value : []
+                minCount <= $0.key + 1 ? $0.value : []
             }
         )
     }
@@ -636,6 +637,26 @@ public final class DicdataStore {
                 for element in result {
                     appendNode(element, endIndex: .surface(i))
                 }
+                for element in self.loanwordAndCountDicdata(ruby: segment) {
+                    appendNode(element, endIndex: .surface(i))
+                }
+                if surfaceProcessRange.leftIndex > 0 {
+                    for element in self.rendakuDicdata(ruby: segment, state: state) {
+                        appendNode(element, endIndex: .surface(i))
+                    }
+                }
+            }
+        }
+        if let inputProcessRange {
+            let found = self.englishWordDicdata(
+                composingText: composingText,
+                leftIndex: inputProcessRange.leftIndex,
+                rightIndexRange: inputProcessRange.rightIndexRange,
+                inputToSurface: composingText.inputIndexToSurfaceIndexMap(),
+                state: state
+            )
+            for (element, endIndex) in found {
+                appendNode(element, endIndex: .input(endIndex))
             }
         }
         return latticeNodes
@@ -844,7 +865,7 @@ public final class DicdataStore {
         ["辻", "辻󠄀"],
         ["禰󠄀", "禰"],
         ["煉󠄁", "煉"],
-        ["崎", "﨑"], // タツザキ
+        ["崎", "﨑", "嵜", "碕"], // タツザキ
         ["栄", "榮"],
         ["吉", "𠮷"], // ツチヨシ
         ["橋", "𣘺", "槗", "𫞎"],
@@ -855,6 +876,34 @@ public final class DicdataStore {
         ["亀", "龜"],
         ["桜", "櫻"],
         ["真", "眞"],
+        ["辺", "邊", "邉"],
+        ["島", "嶋", "嶌"],
+        ["国", "國"],
+        ["広", "廣"],
+        ["竜", "龍"],
+        ["恵", "惠"],
+        ["徳", "德"],
+        ["黒", "黑"],
+        ["曽", "曾"],
+        ["槙", "槇"],
+        ["富", "冨"],
+        ["実", "實"],
+        ["礼", "禮"],
+        ["万", "萬"],
+        ["条", "條"],
+        ["滝", "瀧"],
+        ["渕", "淵"],
+        ["薮", "藪"],
+        ["桧", "檜"],
+        ["蔵", "藏"],
+        ["関", "關"],
+        ["館", "舘"],
+        ["峰", "峯"],
+        ["弥", "彌"],
+        ["巌", "巖"],
+        ["畑", "畠"],
+        ["柳", "栁"],
+        ["衛", "衞"],
 
         // 記号変換
         ["☆", "★", "♡", "☾", "☽"],  // 星
@@ -892,6 +941,24 @@ public final class DicdataStore {
     ]
 
     // 高速ルックアップ用（記号→同一グループ）
+    /// `text` with one of its kanji swapped for a variant (`高橋` → `髙橋`), one
+    /// spelling per variant, in table order.
+    func kanjiVariants(of text: String) -> [String] {
+        var result: [String] = []
+        let characters = Array(text)
+        for (i, character) in characters.enumerated() where !character.isASCII {
+            guard let group = Self.weakRelatingSymbolLookup[String(character)] else {
+                continue
+            }
+            for variant in group where variant != String(character) && variant.count == 1 && !(variant.first?.isASCII ?? true) {
+                var swapped = characters
+                swapped[i] = variant.first!
+                result.append(String(swapped))
+            }
+        }
+        return result
+    }
+
     private static let weakRelatingSymbolLookup: [String: [String]] = {
         var map: [String: [String]] = [:]
         for group in weakRelatingSymbolGroups {

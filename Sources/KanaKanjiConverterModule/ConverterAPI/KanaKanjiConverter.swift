@@ -22,7 +22,7 @@ public final class KanaKanjiConverter {
         case unknownSession(ConversionSessionID)
     }
 
-    private let converter: Kana2Kanji
+    let converter: Kana2Kanji
     private struct ConversionSessionState {
         var previousInputData: ComposingText?
         var lattice: Lattice = .init()
@@ -54,7 +54,10 @@ public final class KanaKanjiConverter {
         UnicodeSpecialCandidateProvider(),
         VersionSpecialCandidateProvider(),
         TimeExpressionSpecialCandidateProvider(),
-        CommaSeparatedNumberSpecialCandidateProvider()
+        CommaSeparatedNumberSpecialCandidateProvider(),
+        NumberStyleSpecialCandidateProvider(),
+        SymbolSpecialCandidateProvider(),
+        EmojiShortcodeSpecialCandidateProvider()
     ]
     private var checker = SpellChecker()
     private var checkerInitialized: [KeyboardLanguage: Bool] = [.none: true, .ja_JP: true]
@@ -71,7 +74,7 @@ public final class KanaKanjiConverter {
     var zenzaiMemoizationCache = ZenzaiMemoizationCache()
     private var zenzaiPersonalization: (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)?
     public private(set) var zenzStatus: String = ""
-    private var dicdataStoreState: DicdataStoreState
+    private(set) var dicdataStoreState: DicdataStoreState
 
     private var currentSessionState: ConversionSessionState {
         self.sessions[self.activeSessionID] ?? .init()
@@ -485,6 +488,21 @@ public final class KanaKanjiConverter {
                 )
         }
         return true
+    }
+
+    /// Zenzaiのモデルが、入力`inputData`に対して候補`candidate`を出力する対数確率。Zenzaiが無効、またはモデルがない場合は`nil`。
+    /// 打った英単語の部分は、変換のときと同じく英単語のままモデルに渡す。
+    public func zenzaiLogProbability(of candidate: Candidate, for inputData: ComposingText, options: ConvertRequestOptions) -> Float? {
+        guard options.zenzaiMode.enabled, let model = self.getModel(modelURL: options.zenzaiMode.weightURL) else {
+            return nil
+        }
+        let spans = inputData.isAtEndIndex ? Kana2Kanji.typedEnglishSpans(in: candidate, inputData: inputData) : []
+        return model.logProbability(
+            convertTarget: Kana2Kanji.zenzInput(inputData.convertTarget, replacing: spans, after: 0),
+            candidateText: candidate.text,
+            versionDependentConfig: options.zenzaiMode.versionDependentMode,
+            memoizationCache: self.zenzaiMemoizationCache
+        )
     }
 
     /// 確定操作後、学習メモリをアップデートする関数。
@@ -1197,9 +1215,63 @@ public final class KanaKanjiConverter {
             }
         }
 
+        // 数量としての読み直し（`手前に文字より` → `手前2文字より`）を2番目に置く
+        if let top = result.first, let reread = self.countedRereading(of: top), !result.contains(where: { $0.text == reread.text }) {
+            result.insert(reread, at: min(1, result.endIndex))
+        }
+
+        // 数と助数詞を漢数字で書いた先頭の候補（`二限`）は、数字で書いたもの（`2限`）を先頭にする
+        if let top = result.first, let digits = self.digitCountRewrite(of: top), !result.contains(where: { $0.text == digits.text }) {
+            result.insert(digits, at: 0)
+        }
+
+        // 単語の異体字（`高橋` → `髙橋`）を元の単語のすぐ後ろに置く
+        result = self.withKanjiVariants(consume result)
+
+
         result.append(contentsOf: consume firstClauseCandidates)
         result.append(contentsOf: consume wordCandidates)
 
+        // ローマ字が途中でかなにならない入力は、1打鍵を直して読める入力の変換を先頭に出す（`arigatpu` → `ありがとう`）
+        if let corrected = self.romajiTypoCorrectedCandidate(inputData, top: result.first), !result.contains(where: { $0.text == corrected.text }) {
+            result.insert(corrected, at: 0)
+            result = [corrected] + Self.romajiKeptLast(result.dropFirst())
+            // 文節は直す前の入力から作ったものなので、直した文全体を1つの文節として選ばせる
+            firstClauseResults = [corrected]
+        }
+
+        // 英字だけを打って支離滅裂な変換にしかならない入力（`gitignore` → `義ちん之`）は、打ったままの英字を先頭に出す
+        if let typed = self.typedLettersCandidate(inputData, top: result.first), !result.contains(where: { $0.text == typed.text }) {
+            result = [typed] + result
+            firstClauseResults = [typed]
+        }
+
+        // 英単語を打った入力では、英単語の書き分けと外来語を先に出し、ローマ字が崩れたままの候補を後ろに回す
+        result = self.withEnglishWordCandidates(consume result, inputData: inputData)
+
+        // 記号の読み（`かぎかっこ` → `「」`）や記号そのもの（`「` → `『`）の入力では、記号を先頭のすぐ後ろに出す。
+        // `。。。`のように置き換えるのが普通の記号は先頭にする
+        if options.specialCandidateProviders.contains(where: { $0 is SymbolSpecialCandidateProvider }) {
+            let symbols = self.symbolCandidates(inputData).filter { symbol in !result.prefix(1).contains { $0.text == symbol.text } }
+            if !symbols.isEmpty {
+                let rest = result.filter { candidate in !symbols.contains { $0.text == candidate.text } }
+                if Self.replacedSymbolInputs.contains(inputData.convertTarget) {
+                    result = symbols.prefix(1) + rest + symbols.dropFirst()
+                } else {
+                    result = rest.prefix(1) + symbols + rest.dropFirst()
+                }
+            }
+        }
+
+        // `:smile` のような絵文字ショートコードの入力では絵文字を先頭に出す
+        if options.specialCandidateProviders.contains(where: { $0 is EmojiShortcodeSpecialCandidateProvider }) {
+            let emoji = self.emojiShortcodeCandidates(inputData)
+            if !emoji.isEmpty {
+                result = self.getUniqueCandidate(emoji.chained(consume result))
+                // Spaceでも絵文字を入力全体の候補として選ばせる
+                firstClauseResults = emoji
+            }
+        }
         result = self.candidates(consume result, matchingPrefix: prefixText)
         predictionResults = self.candidates(consume predictionResults, matchingPrefix: prefixText)
 
@@ -1420,4 +1492,182 @@ public final class KanaKanjiConverter {
         results.append(contentsOf: zeroHints.min(count: 10 - results.count, sortedBy: {$0.value > $1.value}))
         return results
     }
+}
+
+extension KanaKanjiConverter {
+    /// `candidate` with a stretch of words that reads as a counted quantity
+    /// rewritten as one in digits: `手前に文字より` → `手前2文字より` (the other
+    /// reading of `に`, which the lattice ranks below the particle but is often
+    /// what was meant) and `最初の二文字` → `最初の2文字`. The stretch may start in
+    /// the kana a word ends with (`手前に`) and has to end on the counter itself
+    /// (`文字`), so `ここに書いた` never becomes `ここ2回た`. `nil` when there is
+    /// no such stretch.
+    func countedRereading(of candidate: Candidate) -> Candidate? {
+        let data = candidate.data
+        for start in data.indices {
+            let word = Array(data[start].word.toKatakana())
+            let ruby = Array(data[start].ruby)
+            // How many of the word's last characters are kana spelling its reading.
+            let kanaTail = zip(word.reversed(), ruby.reversed()).prefix { $0 == $1 }.count
+            for tail in 0 ... min(kanaTail, ruby.count - 1) {
+                let head: [DicdataElement] = if tail == 0 {
+                    []
+                } else {
+                    [
+                        DicdataElement(
+                            word: String(data[start].word.dropLast(tail)),
+                            ruby: String(ruby.dropLast(tail)),
+                            lcid: data[start].lcid,
+                            rcid: data[start].rcid,
+                            mid: data[start].mid,
+                            value: data[start].value()
+                        ),
+                    ]
+                }
+                var reading = tail == 0 ? "" : String(ruby.suffix(tail))
+                var written = tail == 0 ? "" : String(data[start].word.suffix(tail))
+                for end in start ..< min(data.count, start + Self.maxCountedWords) {
+                    if end > start || tail == 0 {
+                        reading += data[end].ruby
+                        written += data[end].word
+                    }
+                    guard end > start || tail == 0,
+                          let counted = self.converter.dicdataStore.countDicdata(ruby: reading).first(where: { $0.counter == data[end].word }),
+                          counted.element.word != written else {
+                        continue
+                    }
+                    let rewritten = Array(data[..<start]) + head + [counted.element] + Array(data[(end + 1)...])
+                    return Candidate(
+                        text: rewritten.map { $0.word }.joined(),
+                        value: candidate.value - 1,
+                        composingCount: candidate.composingCount,
+                        lastMid: candidate.lastMid,
+                        data: rewritten
+                    )
+                }
+            }
+        }
+        return nil
+    }
+
+    private static let maxCountedWords = 4
+
+    /// `candidate` with a quantity written in kanji numerals and a counter (`二限`, `五分`) rewritten in digits
+    /// (`2限`, `5分`). Words that are idioms rather than quantities (`一番`, `一度`) are left as they are. `nil` when there is none.
+    func digitCountRewrite(of candidate: Candidate) -> Candidate? {
+        let data = candidate.data
+        for start in data.indices {
+            var reading = ""
+            var written = ""
+            for end in start ..< min(data.count, start + 3) {
+                reading += data[end].ruby
+                written += data[end].word
+                guard let numeralCount = written.firstIndex(where: { !Self.kanjiNumerals.contains($0) }).map({ written.distance(from: written.startIndex, to: $0) }),
+                      numeralCount > 0,
+                      // `二三日`（にさんにち）のように単位のない並びは、数でなくおおよその幅を表す
+                      numeralCount == 1 || written.prefix(numeralCount).contains(where: Self.kanjiNumeralUnits.contains),
+                      !Self.numeralIdioms.contains(where: { written.hasPrefix($0) }),
+                      let counted = self.converter.dicdataStore.countDicdata(ruby: reading).first(where: { written.dropFirst(numeralCount) == $0.counter }) else {
+                    continue
+                }
+                let rewritten = Array(data[..<start]) + [counted.element] + Array(data[(end + 1)...])
+                return Candidate(
+                    text: rewritten.map(\.word).joined(),
+                    value: candidate.value,
+                    composingCount: candidate.composingCount,
+                    lastMid: candidate.lastMid,
+                    data: rewritten
+                )
+            }
+        }
+        return nil
+    }
+
+    private static let kanjiNumerals: Set<Character> = Set("〇一二三四五六七八九十百千万")
+    private static let kanjiNumeralUnits: Set<Character> = Set("十百千万")
+    /// 数と助数詞の形をしていても、数として書かない語
+    private static let numeralIdioms: [String] = [
+        "一番", "一度", "二度と", "一緒", "一応", "一般", "一部", "一生", "一体", "一気", "一旦", "一言", "一同", "一定", "一致",
+        "一見", "一流", "一面", "一切", "一層", "一手", "一行", "一時", "一瞬", "一員", "一環", "一家", "一品", "一路", "一筋",
+        "二枚目", "三枚目", "四季", "八百屋", "十分", "百貨店", "千円札", "万一", "一石二鳥", "三日坊主", "七夕",
+    ]
+
+    /// `candidates` with each single short word followed by its spellings with
+    /// a kanji swapped for a variant (`高橋` → `髙橋`), as names are written.
+    private func withKanjiVariants(_ candidates: [Candidate]) -> [Candidate] {
+        var seen = Set(candidates.map(\.text))
+        var result: [Candidate] = []
+        for candidate in candidates {
+            result.append(candidate)
+            guard candidate.data.count == 1, candidate.text.count <= Self.maxVariantWordLength else {
+                continue
+            }
+            let variants = self.converter.dicdataStore.kanjiVariants(of: candidate.text)
+                // Outside the BMP many fonts have no glyph.
+                .filter { $0.unicodeScalars.allSatisfy { $0.value <= 0xFFFF } }
+                .prefix(Self.maxVariantsPerWord)
+            for variant in variants where seen.insert(variant).inserted {
+                var swapped = candidate
+                swapped.text = variant
+                swapped.value -= 1
+                swapped.data[0].word = variant
+                result.append(swapped)
+            }
+        }
+        return result
+    }
+
+    /// `candidates` for an input with typed English words: when the top candidate is one such word, its other
+    /// spellings (`GitHub` → `github`, `GITHUB`, `ｇｉｔｈｕｂ`) and its katakana loanword follow it, and candidates
+    /// that keep unconverted roman letters (`ギテュb`) go after the rest.
+    func withEnglishWordCandidates(_ candidates: [Candidate], inputData: ComposingText) -> [Candidate] {
+        guard let top = candidates.first else {
+            return candidates
+        }
+        let spans = Kana2Kanji.typedEnglishSpans(in: top, inputData: inputData)
+        guard !spans.isEmpty else {
+            return candidates
+        }
+        var result = [top]
+        if top.data.count == 1, let span = spans.first {
+            let typed = String(inputData.input.compactMap(DicdataStore.romanLetter))
+            let spellings = [
+                DicdataStore.katakanaLoanword(english: span.word),
+                typed,
+                typed.lowercased(),
+                typed.uppercased(),
+                typed.prefix(1).uppercased() + typed.dropFirst().lowercased(),
+                typed.applyingTransform(.fullwidthToHalfwidth, reverse: true),
+            ]
+            for spelling in spellings.compactMap({ $0 }) where !result.contains(where: { $0.text == spelling }) {
+                var variant = top
+                variant.text = spelling
+                variant.value -= 1
+                variant.data[0].word = spelling
+                result.append(variant)
+            }
+        }
+        let rest = candidates.dropFirst().filter { candidate in !result.contains(where: { $0.text == candidate.text }) }
+        result.append(contentsOf: Self.romajiKeptLast(rest))
+        return result
+    }
+
+    /// `candidates` with those that keep unconverted roman letters (`ギテュb`) after the others, in the same order otherwise.
+    static func romajiKeptLast<C: Collection<Candidate>>(_ candidates: C) -> [Candidate] {
+        let keepsRomaji: (Candidate) -> Bool = { candidate in
+            candidate.data.contains { $0.mid != MIDData.英単語.mid && $0.word.contains(where: Self.isLatinLetter) }
+        }
+        return candidates.filter { !keepsRomaji($0) } + candidates.filter(keepsRomaji)
+    }
+
+    /// 半角・全角のラテン文字
+    static func isLatinLetter(_ character: Character) -> Bool {
+        (character.isASCII && character.isLetter) || ("Ａ" ... "Ｚ").contains(character) || ("ａ" ... "ｚ").contains(character)
+    }
+
+    /// 打ったまま残すことのない記号の並び。入力した時点で変換する
+    private static let replacedSymbolInputs: Set<String> = ["。。。", "...", "・・・", "．．．"]
+
+    private static let maxVariantWordLength = 4
+    private static let maxVariantsPerWord = 2
 }

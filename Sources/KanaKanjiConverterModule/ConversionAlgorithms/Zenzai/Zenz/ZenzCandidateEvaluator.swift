@@ -233,7 +233,7 @@ struct ZenzCandidateEvaluator {
         if candidate.data.contains(where: { !$0.metadata.isDisjoint(with: Self.userWordMetadata) }) {
             let candidateLearnedTokens = candidate.data.flatMap {
                 Array(
-                    repeating: !$0.metadata.isDisjoint(with: Self.userWordMetadata) ? logf(self.learningPriority(data: $0)) : 0,
+                    repeating: !$0.metadata.isDisjoint(with: Self.userWordMetadata) ? self.learnedLogitBonus(data: $0) : 0,
                     count: context.encode($0.word, addBOS: false).count
                 )
             }
@@ -538,6 +538,46 @@ struct ZenzCandidateEvaluator {
         }
     }
 
+    /// The model's log probability of `candidateText` (and the end of the output) for `input`, summed over tokens.
+    static func logProbability(
+        context: ZenzContext,
+        input: String,
+        candidateText: String,
+        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
+        memoizationCache: ZenzaiMemoizationCache
+    ) -> Float? {
+        let prompt = ZenzPromptBuilder.candidateEvaluationPrompt(
+            input: input,
+            inputCursorPosition: nil,
+            userDictionaryPrompt: "",
+            versionDependentConfig: versionDependentConfig
+        )
+        let text = self.candidateTextForEvaluation(candidateText: candidateText, input: input, inputCursorPosition: nil, versionDependentConfig: versionDependentConfig)
+        let promptTokens = context.encodeEvaluationPrompt(prompt, memoizationCache: memoizationCache)
+        let tokens = promptTokens + context.encode(text, addBOS: false, addEOS: false) + [context.eosToken]
+        let startOffset = promptTokens.count - 1
+        guard startOffset >= 0, let logits = context.evaluationLogits(tokens: Array(tokens.dropLast()), startOffset: startOffset) else {
+            return nil
+        }
+        // 次の評価が前回のプロンプトを使い回さないようにする
+        context.setPreviousEvaluationPrompt("")
+        let vocabulary = context.vocabSize
+        var total: Float = 0
+        for i in promptTokens.count ..< tokens.count {
+            let row = logits + (i - 1 - startOffset) * vocabulary
+            var maximum = -Float.infinity
+            for v in 0 ..< vocabulary {
+                maximum = max(maximum, row[v])
+            }
+            var sum: Float = 0
+            for v in 0 ..< vocabulary {
+                sum += expf(row[v] - maximum)
+            }
+            total += row[Int(tokens[i])] - maximum - logf(sum)
+        }
+        return total
+    }
+
     private static func learningPriority(data: DicdataElement) -> Float {
         // 文字数の長い候補ほど優先的に適用されるようにする
         // 積極的な複合語化の効果を期待
@@ -548,5 +588,12 @@ struct ZenzCandidateEvaluator {
         } else {
             30
         }
+    }
+
+    /// 学習・ユーザ辞書の語のトークンに足すlogit
+    private static func learnedLogitBonus(data: DicdataElement) -> Float {
+        // 確定した名前のように、利用者がかなと違う表記を選んだ語は、モデルが知らなくても使い続ける
+        let chosenSpelling: Float = data.word.toKatakana() == data.ruby ? 0 : 4
+        return logf(self.learningPriority(data: data)) + chosenSpelling
     }
 }

@@ -95,6 +95,26 @@ package final class Zenz {
         }
     }
 
+    func logProbability(
+        convertTarget: String,
+        candidateText: String,
+        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
+        memoizationCache: ZenzaiMemoizationCache
+    ) -> Float? {
+        self.inferenceLock.withLock {
+            guard let zenzContext else {
+                return nil
+            }
+            return ZenzCandidateEvaluator.logProbability(
+                context: zenzContext,
+                input: convertTarget.toKatakana(),
+                candidateText: candidateText,
+                versionDependentConfig: versionDependentConfig,
+                memoizationCache: memoizationCache
+            )
+        }
+    }
+
     func predictNextInputText(
         leftSideContext: String,
         composingText: String,

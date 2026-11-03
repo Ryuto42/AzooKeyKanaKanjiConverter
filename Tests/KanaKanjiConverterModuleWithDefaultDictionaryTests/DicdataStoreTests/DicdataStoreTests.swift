@@ -270,6 +270,18 @@ final class DicdataStoreTests: XCTestCase {
         }
     }
 
+    func testKanjiVariantDicdata() throws {
+        let dicdataStore = DicdataStore.withDefaultDictionary()
+        func variants(of kanji: String) -> [String] {
+            dicdataStore.getWiseDicdata(convertTarget: kanji, surfaceRange: 0..<1, fullText: Array(kanji), keyboardLanguage: .ja_JP).map(\.word)
+        }
+        XCTAssertTrue(variants(of: "高").contains("髙"))
+        XCTAssertTrue(variants(of: "崎").contains("嵜"))
+        XCTAssertTrue(variants(of: "邊").contains("辺"))
+        XCTAssertTrue(variants(of: "辺").contains("邉"))
+        XCTAssertTrue(variants(of: "國").contains("国"))
+    }
+
     func testDynamicUserDict() throws {
         let dicdataStore = DicdataStore.withDefaultDictionary()
 

@@ -207,6 +207,21 @@ extension Kana2Kanji {
             ).droppedSuffixCount > 0
         var constraint = zenzaiCache?.getNewConstraint(for: latticeInputData) ?? PrefixConstraint([])
         let prefixCandidate = zenzaiCache?.prefixCandidate(remainingIn: latticeInputData)
+        if !constraint.isEmpty {
+            // 英単語を打ち終える前にモデルが認めた先頭（`git`の`ぎて`）が、打ち終えた英単語を妨げないようにする
+            let unconstrained = self.kana2lattice_all(
+                latticeInputData,
+                N_best: 1,
+                needTypoCorrection: false,
+                preprocessedLattice: zenzaiCache?.getPreprocessedLattice(for: latticeInputData, kanaKanji: self, dicdataStoreState: dicdataStoreState),
+                dicdataStoreState: dicdataStoreState
+            )
+            if let best = unconstrained.result.getCandidateData().map(self.processClauseCandidate).max(by: { $0.value < $1.value }) {
+                let spans = (Self.typedEnglishSpans(in: best, inputData: latticeInputData) + Self.userWordSpans(in: best))
+                    .sorted { $0.text.lowerBound < $1.text.lowerBound }
+                constraint = Self.constraint(constraint, keeping: spans, in: best)
+            }
+        }
         let resolvedConversionCacheKey: ZenzResolvedConversionCacheKey? =
             if !requestRichCandidates,
                personalizationMode == nil,
@@ -421,8 +436,9 @@ extension Kana2Kanji {
                         )
                     )
                 }
+                let englishSpans = zenzInputCursorPosition == nil ? Self.typedEnglishSpans(in: candidate, inputData: latticeInputData) : []
                 let reviewResult = zenz.candidateEvaluate(
-                    convertTarget: inputData.convertTarget,
+                    convertTarget: Self.zenzInput(inputData.convertTarget, replacing: englishSpans, after: constraint.fixedPrefix?.rubyCount ?? 0),
                     convertTargetCursorPosition: zenzInputCursorPosition,
                     candidates: [candidate],
                     requestRichCandidates: requestRichCandidates,

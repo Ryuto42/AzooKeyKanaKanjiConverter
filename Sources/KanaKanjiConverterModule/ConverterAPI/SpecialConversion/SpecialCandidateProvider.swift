@@ -51,6 +51,27 @@ public struct CommaSeparatedNumberSpecialCandidateProvider: SpecialCandidateProv
     }
 }
 
+public struct NumberStyleSpecialCandidateProvider: SpecialCandidateProvider {
+    public init() {}
+    public func provideCandidates(converter: KanaKanjiConverter, inputData: ComposingText, options _: ConvertRequestOptions) -> [Candidate] {
+        converter.numberStyleCandidates(inputData)
+    }
+}
+
+public struct SymbolSpecialCandidateProvider: SpecialCandidateProvider {
+    public init() {}
+    public func provideCandidates(converter: KanaKanjiConverter, inputData: ComposingText, options _: ConvertRequestOptions) -> [Candidate] {
+        converter.symbolCandidates(inputData)
+    }
+}
+
+public struct EmojiShortcodeSpecialCandidateProvider: SpecialCandidateProvider {
+    public init() {}
+    public func provideCandidates(converter: KanaKanjiConverter, inputData: ComposingText, options _: ConvertRequestOptions) -> [Candidate] {
+        converter.emojiShortcodeCandidates(inputData)
+    }
+}
+
 public extension SpecialCandidateProvider where Self == CalendarSpecialCandidateProvider {
     static var calendar: Self { .init() }
 }
@@ -77,4 +98,16 @@ public extension SpecialCandidateProvider where Self == TimeExpressionSpecialCan
 
 public extension SpecialCandidateProvider where Self == CommaSeparatedNumberSpecialCandidateProvider {
     static var commaSeparatedNumber: Self { .init() }
+}
+
+public extension SpecialCandidateProvider where Self == NumberStyleSpecialCandidateProvider {
+    static var numberStyle: Self { .init() }
+}
+
+public extension SpecialCandidateProvider where Self == SymbolSpecialCandidateProvider {
+    static var symbol: Self { .init() }
+}
+
+public extension SpecialCandidateProvider where Self == EmojiShortcodeSpecialCandidateProvider {
+    static var emojiShortcode: Self { .init() }
 }
